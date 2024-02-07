@@ -7,6 +7,8 @@
 import argparse
 import json
 import os
+import shutil
+from enum import Enum
 from multiprocessing import Manager, Pool
 from pathlib import Path
 from typing import Callable, List, Set
@@ -18,10 +20,19 @@ OMIT_BLACK_LIST = False
 OMIT_GRAY_LIST = False
 
 
+class JobType(Enum):
+    # Copy the asset as-is, skipping all processing.
+    COPY = 1
+    # Process the asset to make it compatible with Unity.
+    # Enable 'job.decimate' to simplify the model.
+    PROCESS = 2
+
+
 class Job:
     source_path: str
     dest_path: str
-    simplify: bool
+    job_type: JobType
+    decimate: bool = False
 
 
 def file_is_scene_config(filepath: str) -> bool:
@@ -106,37 +117,52 @@ def process_model(args):
     # Create all necessary subdirectories
     os.makedirs(os.path.dirname(job.dest_path), exist_ok=True)
 
-    try:
-        source_tris, target_tris, simplified_tris = decimate.decimate(
-            inputFile=job.source_path,
-            outputFile=job.dest_path,
+    source_tris: int = 0
+    target_tris: int = 0
+    simplified_tris: int = 0
+
+    def process_fn(simplify: bool):
+        return decimate.decimate(
+            input_file=job.source_path,
+            output_file=job.dest_path,
             quiet=True,
-            sloppy=False,
-            simplify=job.simplify,
+            simplify=simplify,
         )
-    except Exception:
+
+    job_type: JobType = job.job_type
+    if job_type == JobType.COPY:
+        shutil.copyfile(job.source_path, job.dest_path, follow_symlinks=True)
+    else:
         try:
-            print(
-                f"Unable to decimate: {job.source_path}. Trying passthrough (no decimation)."
-            )
-            source_tris, target_tris, simplified_tris = decimate.decimate(
-                inputFile=job.source_path,
-                outputFile=job.dest_path,
-                quiet=True,
-                simplify=False,
+            source_tris, target_tris, simplified_tris = process_fn(
+                job.decimate
             )
         except Exception:
-            print(f"Unable to decimate: {job.source_path}")
-            result = {"status": "error"}
-            return result
+            # Retry without decimation.
+            if job.decimate:
+                try:
+                    print(
+                        f"Unable to process: {job.source_path}. Trying without decimation."
+                    )
+                    source_tris, target_tris, simplified_tris = process_fn(
+                        False
+                    )
+                except Exception:
+                    print(f"Unable to process: {job.source_path}")
+                    result = {"status": "error"}
+                    return result
+            else:
+                print(f"Unable to process: {job.source_path}")
+                result = {"status": "error"}
+                return result
 
     print(
         f"source_tris: {source_tris}, target_tris: {target_tris}, simplified_tris: {simplified_tris}"
     )
 
     result = {
-        "source_tris": source_tris,
-        "simplified_tris": simplified_tris,
+        "source_tris": str(source_tris),
+        "simplified_tris": str(simplified_tris),
         "source_path": job.source_path,
         "status": "ok",
     }
@@ -301,7 +327,7 @@ def main():
         job = Job()
         job.source_path = os.path.join(args.hssd_hab_root_dir, rel_path)
         job.dest_path = os.path.join(OUTPUT_DIR, hssd_hab_rel_dir, rel_path)
-        job.simplify = False
+        job.job_type = JobType.PROCESS
         jobs.append(job)
 
     # Add all models contained in the scenes
@@ -321,7 +347,8 @@ def main():
             job.dest_path = os.path.join(
                 OUTPUT_DIR, hssd_hab_rel_dir, rel_path
             )
-            job.simplify = False
+            job.job_type = JobType.PROCESS
+            job.decimate = True
             jobs.append(job)
         else:
             job = Job()
@@ -329,7 +356,8 @@ def main():
             job.dest_path = os.path.join(
                 OUTPUT_DIR, hssd_hab_rel_dir, rel_path
             )
-            job.simplify = False
+            job.job_type = JobType.PROCESS
+            job.decimate = True
             jobs.append(job)
 
     # Add ycb objects
@@ -338,7 +366,7 @@ def main():
         job = Job()
         job.source_path = os.path.join("data", rel_path)
         job.dest_path = os.path.join(OUTPUT_DIR, rel_path)
-        job.simplify = False
+        job.job_type = JobType.PROCESS
         jobs.append(job)
 
     # Add spot models
@@ -349,7 +377,18 @@ def main():
         job = Job()
         job.source_path = os.path.join("data", rel_path)
         job.dest_path = os.path.join(OUTPUT_DIR, rel_path)
-        job.simplify = False
+        job.job_type = JobType.PROCESS
+        jobs.append(job)
+
+    # Add humanoids.
+    for filename in Path("data/humanoids/humanoid_data").rglob("*.glb"):
+        rel_path = str(filename)[len("data/") :]
+        job = Job()
+        job.source_path = os.path.join("data", rel_path)
+        job.dest_path = os.path.join(OUTPUT_DIR, rel_path)
+        # GltfSceneConverter doesn't support skinning.
+        # Use humanoid models as-is.
+        job.job_type = JobType.COPY
         jobs.append(job)
 
     simplify_models(jobs)
